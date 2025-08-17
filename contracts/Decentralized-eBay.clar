@@ -158,6 +158,8 @@
 (define-constant ERR-BID-TOO-LOW (err u108))
 (define-constant ERR-AUCTION-ACTIVE (err u109))
 (define-constant ERR-NOT-WINNER (err u110))
+(define-constant ERR-ALREADY-FAVORITED (err u111))
+(define-constant ERR-NOT-FAVORITED (err u112))
 
 (define-map Auctions
     { listing-id: uint }
@@ -300,8 +302,8 @@
     (map-get? Bids {listing-id: listing-id, bidder: bidder})
 )
 
-(define-constant ERR-INVALID-CATEGORY (err u111))
-(define-constant ERR-INVALID-FILTER (err u112))
+(define-constant ERR-INVALID-CATEGORY (err u113))
+(define-constant ERR-INVALID-FILTER (err u114))
 
 (define-data-var category-count uint u8)
 
@@ -449,4 +451,78 @@
         (map-get? Categories {category-id: u7})
         (map-get? Categories {category-id: u8})
     )
+)
+
+(define-map UserFavorites
+    { user: principal, listing-id: uint }
+    {
+        added-at: uint,
+        category-id: (optional uint)
+    }
+)
+
+(define-map UserFavoriteCounts
+    { user: principal }
+    {
+        total-favorites: uint
+    }
+)
+
+(define-public (add-to-favorites (listing-id uint))
+    (let
+        ((listing (unwrap! (map-get? Listings {listing-id: listing-id}) ERR-NOT-FOUND))
+         (favorite-key {user: tx-sender, listing-id: listing-id})
+         (listing-category (map-get? ListingCategories {listing-id: listing-id}))
+         (user-count (default-to {total-favorites: u0} (map-get? UserFavoriteCounts {user: tx-sender}))))
+        
+        (asserts! (is-none (map-get? UserFavorites favorite-key)) ERR-ALREADY-FAVORITED)
+        
+        (map-insert UserFavorites
+            favorite-key
+            {
+                added-at: burn-block-height,
+                category-id: (if (is-some listing-category) 
+                    (some (get category-id (unwrap-panic listing-category))) 
+                    none)
+            }
+        )
+        
+        (map-set UserFavoriteCounts
+            {user: tx-sender}
+            {total-favorites: (+ (get total-favorites user-count) u1)}
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (remove-from-favorites (listing-id uint))
+    (let
+        ((favorite-key {user: tx-sender, listing-id: listing-id})
+         (favorite (unwrap! (map-get? UserFavorites favorite-key) ERR-NOT-FAVORITED))
+         (user-count (default-to {total-favorites: u0} (map-get? UserFavoriteCounts {user: tx-sender}))))
+        
+        (map-delete UserFavorites favorite-key)
+        
+        (map-set UserFavoriteCounts
+            {user: tx-sender}
+            {total-favorites: (if (> (get total-favorites user-count) u0) 
+                (- (get total-favorites user-count) u1) 
+                u0)}
+        )
+        
+        (ok true)
+    )
+)
+
+(define-read-only (is-favorited (user principal) (listing-id uint))
+    (is-some (map-get? UserFavorites {user: user, listing-id: listing-id}))
+)
+
+(define-read-only (get-user-favorite-count (user principal))
+    (get total-favorites (default-to {total-favorites: u0} (map-get? UserFavoriteCounts {user: user})))
+)
+
+(define-read-only (get-favorite-details (user principal) (listing-id uint))
+    (map-get? UserFavorites {user: user, listing-id: listing-id})
 )
