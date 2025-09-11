@@ -526,3 +526,292 @@
 (define-read-only (get-favorite-details (user principal) (listing-id uint))
     (map-get? UserFavorites {user: user, listing-id: listing-id})
 )
+
+(define-constant ERR-BULK-LIMIT-EXCEEDED (err u115))
+(define-constant ERR-BULK-OPERATION-FAILED (err u116))
+(define-constant MAX-BULK-OPERATIONS u10)
+
+(define-data-var bulk-operation-id uint u0)
+
+(define-map BulkOperationResults
+    { operation-id: uint }
+    {
+        initiator: principal,
+        total-operations: uint,
+        successful-operations: uint,
+        failed-operations: uint,
+        created-at: uint
+    }
+)
+
+(define-map BulkOperationDetails
+    { operation-id: uint, index: uint }
+    {
+        operation-type: (string-ascii 20),
+        target-id: uint,
+        success: bool,
+        error-code: (optional uint)
+    }
+)
+
+(define-public (bulk-create-listings (listings-data (list 10 {title: (string-ascii 100), description: (string-ascii 500), price: uint})))
+    (let
+        ((operation-id (var-get bulk-operation-id))
+         (total-count (len listings-data))
+         (results (fold process-bulk-listing listings-data {successful: u0, failed: u0, index: u0, operation-id: operation-id})))
+        
+        (asserts! (<= total-count MAX-BULK-OPERATIONS) ERR-BULK-LIMIT-EXCEEDED)
+        
+        (map-set BulkOperationResults
+            {operation-id: operation-id}
+            {
+                initiator: tx-sender,
+                total-operations: total-count,
+                successful-operations: (get successful results),
+                failed-operations: (get failed results),
+                created-at: burn-block-height
+            }
+        )
+        
+        (var-set bulk-operation-id (+ operation-id u1))
+        (ok {operation-id: operation-id, successful: (get successful results), failed: (get failed results)})
+    )
+)
+
+(define-private (process-bulk-listing (listing-data {title: (string-ascii 100), description: (string-ascii 500), price: uint}) (acc {successful: uint, failed: uint, index: uint, operation-id: uint}))
+    (let
+        ((listing-id (var-get next-listing-id))
+         (creation-result (map-insert Listings
+            {listing-id: listing-id}
+            {
+                seller: tx-sender,
+                title: (get title listing-data),
+                description: (get description listing-data),
+                price: (get price listing-data),
+                created-at: burn-block-height,
+                status: "active",
+                buyer: none
+            }
+         )))
+        
+        (if creation-result
+            (begin
+                (var-set next-listing-id (+ listing-id u1))
+                (map-set BulkOperationDetails
+                    {operation-id: (get operation-id acc), index: (get index acc)}
+                    {
+                        operation-type: "create-listing",
+                        target-id: listing-id,
+                        success: true,
+                        error-code: none
+                    }
+                )
+                {
+                    successful: (+ (get successful acc) u1),
+                    failed: (get failed acc),
+                    index: (+ (get index acc) u1),
+                    operation-id: (get operation-id acc)
+                }
+            )
+            (begin
+                (map-set BulkOperationDetails
+                    {operation-id: (get operation-id acc), index: (get index acc)}
+                    {
+                        operation-type: "create-listing",
+                        target-id: u0,
+                        success: false,
+                        error-code: (some u105)
+                    }
+                )
+                {
+                    successful: (get successful acc),
+                    failed: (+ (get failed acc) u1),
+                    index: (+ (get index acc) u1),
+                    operation-id: (get operation-id acc)
+                }
+            )
+        )
+    )
+)
+
+(define-public (bulk-add-favorites (listing-ids (list 10 uint)))
+    (let
+        ((operation-id (var-get bulk-operation-id))
+         (total-count (len listing-ids))
+         (results (fold process-bulk-favorite listing-ids {successful: u0, failed: u0, index: u0, operation-id: operation-id})))
+        
+        (asserts! (<= total-count MAX-BULK-OPERATIONS) ERR-BULK-LIMIT-EXCEEDED)
+        
+        (map-set BulkOperationResults
+            {operation-id: operation-id}
+            {
+                initiator: tx-sender,
+                total-operations: total-count,
+                successful-operations: (get successful results),
+                failed-operations: (get failed results),
+                created-at: burn-block-height
+            }
+        )
+        
+        (var-set bulk-operation-id (+ operation-id u1))
+        (ok {operation-id: operation-id, successful: (get successful results), failed: (get failed results)})
+    )
+)
+
+(define-private (process-bulk-favorite (listing-id uint) (acc {successful: uint, failed: uint, index: uint, operation-id: uint}))
+    (let
+        ((favorite-key {user: tx-sender, listing-id: listing-id})
+         (listing-exists (is-some (map-get? Listings {listing-id: listing-id})))
+         (not-favorited (is-none (map-get? UserFavorites favorite-key)))
+         (listing-category (map-get? ListingCategories {listing-id: listing-id}))
+         (user-count (default-to {total-favorites: u0} (map-get? UserFavoriteCounts {user: tx-sender}))))
+        
+        (if (and listing-exists not-favorited)
+            (begin
+                (map-insert UserFavorites
+                    favorite-key
+                    {
+                        added-at: burn-block-height,
+                        category-id: (if (is-some listing-category) 
+                            (some (get category-id (unwrap-panic listing-category))) 
+                            none)
+                    }
+                )
+                (map-set UserFavoriteCounts
+                    {user: tx-sender}
+                    {total-favorites: (+ (get total-favorites user-count) u1)}
+                )
+                (map-set BulkOperationDetails
+                    {operation-id: (get operation-id acc), index: (get index acc)}
+                    {
+                        operation-type: "add-favorite",
+                        target-id: listing-id,
+                        success: true,
+                        error-code: none
+                    }
+                )
+                {
+                    successful: (+ (get successful acc) u1),
+                    failed: (get failed acc),
+                    index: (+ (get index acc) u1),
+                    operation-id: (get operation-id acc)
+                }
+            )
+            (begin
+                (map-set BulkOperationDetails
+                    {operation-id: (get operation-id acc), index: (get index acc)}
+                    {
+                        operation-type: "add-favorite",
+                        target-id: listing-id,
+                        success: false,
+                        error-code: (some (if listing-exists u111 u104))
+                    }
+                )
+                {
+                    successful: (get successful acc),
+                    failed: (+ (get failed acc) u1),
+                    index: (+ (get index acc) u1),
+                    operation-id: (get operation-id acc)
+                }
+            )
+        )
+    )
+)
+
+(define-public (bulk-update-listing-prices (updates (list 10 {listing-id: uint, new-price: uint})))
+    (let
+        ((operation-id (var-get bulk-operation-id))
+         (total-count (len updates))
+         (results (fold process-bulk-price-update updates {successful: u0, failed: u0, index: u0, operation-id: operation-id})))
+        
+        (asserts! (<= total-count MAX-BULK-OPERATIONS) ERR-BULK-LIMIT-EXCEEDED)
+        
+        (map-set BulkOperationResults
+            {operation-id: operation-id}
+            {
+                initiator: tx-sender,
+                total-operations: total-count,
+                successful-operations: (get successful results),
+                failed-operations: (get failed results),
+                created-at: burn-block-height
+            }
+        )
+        
+        (var-set bulk-operation-id (+ operation-id u1))
+        (ok {operation-id: operation-id, successful: (get successful results), failed: (get failed results)})
+    )
+)
+
+(define-private (process-bulk-price-update (update {listing-id: uint, new-price: uint}) (acc {successful: uint, failed: uint, index: uint, operation-id: uint}))
+    (let
+        ((listing-id (get listing-id update))
+         (new-price (get new-price update))
+         (listing (map-get? Listings {listing-id: listing-id})))
+        
+        (if (and (is-some listing) (is-eq tx-sender (get seller (unwrap-panic listing))) (is-eq (get status (unwrap-panic listing)) "active"))
+            (begin
+                (map-set Listings
+                    {listing-id: listing-id}
+                    (merge (unwrap-panic listing) {price: new-price})
+                )
+                (let ((listing-category (map-get? ListingCategories {listing-id: listing-id})))
+                    (if (is-some listing-category)
+                        (map-set CategoryListings
+                            {category-id: (get category-id (unwrap-panic listing-category)), listing-id: listing-id}
+                            {
+                                created-at: (get created-at (unwrap-panic listing)),
+                                price: new-price,
+                                status: (get status (unwrap-panic listing))
+                            }
+                        )
+                        true
+                    )
+                )
+                (map-set BulkOperationDetails
+                    {operation-id: (get operation-id acc), index: (get index acc)}
+                    {
+                        operation-type: "update-price",
+                        target-id: listing-id,
+                        success: true,
+                        error-code: none
+                    }
+                )
+                {
+                    successful: (+ (get successful acc) u1),
+                    failed: (get failed acc),
+                    index: (+ (get index acc) u1),
+                    operation-id: (get operation-id acc)
+                }
+            )
+            (begin
+                (map-set BulkOperationDetails
+                    {operation-id: (get operation-id acc), index: (get index acc)}
+                    {
+                        operation-type: "update-price",
+                        target-id: listing-id,
+                        success: false,
+                        error-code: (some (if (is-some listing) u100 u104))
+                    }
+                )
+                {
+                    successful: (get successful acc),
+                    failed: (+ (get failed acc) u1),
+                    index: (+ (get index acc) u1),
+                    operation-id: (get operation-id acc)
+                }
+            )
+        )
+    )
+)
+
+(define-read-only (get-bulk-operation-results (operation-id uint))
+    (map-get? BulkOperationResults {operation-id: operation-id})
+)
+
+(define-read-only (get-bulk-operation-detail (operation-id uint) (index uint))
+    (map-get? BulkOperationDetails {operation-id: operation-id, index: index})
+)
+
+(define-read-only (get-next-bulk-operation-id)
+    (var-get bulk-operation-id)
+)
