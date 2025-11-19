@@ -1197,3 +1197,209 @@
         )
     )
 )
+
+(define-constant ERR-DISPUTE-NOT-FOUND (err u124))
+(define-constant ERR-DISPUTE-CLOSED (err u125))
+(define-constant ERR-APPEAL-LIMIT-REACHED (err u126))
+(define-constant ERR-INVALID-EVIDENCE (err u127))
+(define-constant ERR-DISPUTE-NOT-ELIGIBLE (err u128))
+(define-constant ERR-APPEAL-WINDOW-CLOSED (err u129))
+(define-constant ERR-DISPUTE-NOT-CLOSED (err u130))
+
+(define-data-var next-dispute-id uint u0)
+(define-data-var appeal-window uint u288)
+
+(define-map Disputes
+    { dispute-id: uint }
+    {
+        listing-id: uint,
+        seller: principal,
+        initiator: principal,
+        reason: (string-ascii 200),
+        created-at: uint,
+        status: (string-ascii 20),
+        resolution: (optional (string-ascii 200)),
+        resolution-type: (optional (string-ascii 20))
+    }
+)
+
+(define-map DisputeEvidence
+    { dispute-id: uint, submitter: principal }
+    {
+        evidence-text: (string-utf8 500),
+        submitted-at: uint,
+        evidence-type: (string-ascii 50)
+    }
+)
+
+(define-map DisputeAppeals
+    { dispute-id: uint, appeal-number: uint }
+    {
+        appellant: principal,
+        appeal-reason: (string-utf8 300),
+        created-at: uint,
+        status: (string-ascii 20),
+        reviewer-notes: (optional (string-utf8 200))
+    }
+)
+
+(define-map SellerDisputeStats
+    { seller: principal }
+    {
+        total-disputes: uint,
+        resolved-disputes: uint,
+        won-disputes: uint,
+        appealed-disputes: uint
+    }
+)
+
+(define-public (initiate-dispute (listing-id uint) (reason (string-ascii 200)))
+    (let
+        ((listing (unwrap! (map-get? Listings {listing-id: listing-id}) ERR-NOT-FOUND))
+         (seller (get seller listing))
+         (dispute-id (var-get next-dispute-id))
+         (current-height burn-block-height))
+        
+        (asserts! (is-eq tx-sender seller) ERR-NOT-AUTHORIZED)
+        (asserts! (or (is-eq (get status listing) "pending") (is-eq (get status listing) "completed")) ERR-DISPUTE-NOT-ELIGIBLE)
+        (asserts! (> (len reason) u0) ERR-INVALID-EVIDENCE)
+        
+        (map-insert Disputes
+            { dispute-id: dispute-id }
+            {
+                listing-id: listing-id,
+                seller: seller,
+                initiator: tx-sender,
+                reason: reason,
+                created-at: current-height,
+                status: "open",
+                resolution: none,
+                resolution-type: none
+            }
+        )
+        
+        (update-seller-dispute-stats seller)
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (submit-dispute-evidence (dispute-id uint) (evidence-text (string-utf8 500)) (evidence-type (string-ascii 50)))
+    (let
+        ((dispute (unwrap! (map-get? Disputes {dispute-id: dispute-id}) ERR-DISPUTE-NOT-FOUND))
+         (listing (unwrap! (map-get? Listings {listing-id: (get listing-id dispute)}) ERR-NOT-FOUND))
+         (buyer-opt (get buyer listing))
+         (current-height burn-block-height))
+        
+        (asserts! (is-eq (get status dispute) "open") ERR-DISPUTE-CLOSED)
+        (asserts! (or (is-eq tx-sender (get seller dispute)) (is-eq (some tx-sender) buyer-opt)) ERR-NOT-AUTHORIZED)
+        
+        (map-set DisputeEvidence
+            { dispute-id: dispute-id, submitter: tx-sender }
+            {
+                evidence-text: evidence-text,
+                submitted-at: current-height,
+                evidence-type: evidence-type
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (resolution (string-ascii 200)) (resolution-type (string-ascii 20)))
+    (let
+        ((dispute (unwrap! (map-get? Disputes {dispute-id: dispute-id}) ERR-DISPUTE-NOT-FOUND)))
+        
+        (asserts! (is-eq (get status dispute) "open") ERR-DISPUTE-CLOSED)
+        (asserts! (or (is-eq resolution-type "seller-won") (is-eq resolution-type "buyer-won") (is-eq resolution-type "partial-refund")) ERR-INVALID-EVIDENCE)
+        
+        (map-set Disputes
+            { dispute-id: dispute-id }
+            (merge dispute {
+                status: "resolved",
+                resolution: (some resolution),
+                resolution-type: (some resolution-type)
+            })
+        )
+        
+        (update-seller-dispute-resolution-stats (get seller dispute) resolution-type)
+        (ok true)
+    )
+)
+
+(define-public (appeal-dispute-resolution (dispute-id uint) (appeal-reason (string-utf8 300)))
+    (let
+        ((dispute (unwrap! (map-get? Disputes {dispute-id: dispute-id}) ERR-DISPUTE-NOT-FOUND))
+         (seller (get seller dispute))
+         (seller-stats (default-to {total-disputes: u0, resolved-disputes: u0, won-disputes: u0, appealed-disputes: u0} (map-get? SellerDisputeStats {seller: seller})))
+         (current-appeal-count (get appealed-disputes seller-stats))
+         (current-height burn-block-height))
+        
+        (asserts! (is-eq (get status dispute) "resolved") ERR-DISPUTE-NOT-CLOSED)
+        (asserts! (is-eq tx-sender seller) ERR-NOT-AUTHORIZED)
+        (asserts! (< current-appeal-count u3) ERR-APPEAL-LIMIT-REACHED)
+        
+        (map-insert DisputeAppeals
+            { dispute-id: dispute-id, appeal-number: (+ current-appeal-count u1) }
+            {
+                appellant: tx-sender,
+                appeal-reason: appeal-reason,
+                created-at: current-height,
+                status: "pending",
+                reviewer-notes: none
+            }
+        )
+        
+        (map-set SellerDisputeStats
+            { seller: seller }
+            (merge seller-stats { appealed-disputes: (+ current-appeal-count u1) })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-private (update-seller-dispute-stats (seller principal))
+    (let
+        ((current-stats (default-to {total-disputes: u0, resolved-disputes: u0, won-disputes: u0, appealed-disputes: u0} (map-get? SellerDisputeStats {seller: seller}))))
+        
+        (map-set SellerDisputeStats
+            { seller: seller }
+            (merge current-stats { total-disputes: (+ (get total-disputes current-stats) u1) })
+        )
+    )
+)
+
+(define-private (update-seller-dispute-resolution-stats (seller principal) (resolution-type (string-ascii 20)))
+    (let
+        ((current-stats (default-to {total-disputes: u0, resolved-disputes: u0, won-disputes: u0, appealed-disputes: u0} (map-get? SellerDisputeStats {seller: seller}))))
+        
+        (map-set SellerDisputeStats
+            { seller: seller }
+            (merge current-stats {
+                resolved-disputes: (+ (get resolved-disputes current-stats) u1),
+                won-disputes: (if (is-eq resolution-type "seller-won") (+ (get won-disputes current-stats) u1) (get won-disputes current-stats))
+            })
+        )
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? Disputes {dispute-id: dispute-id})
+)
+
+(define-read-only (get-dispute-evidence (dispute-id uint) (submitter principal))
+    (map-get? DisputeEvidence {dispute-id: dispute-id, submitter: submitter})
+)
+
+(define-read-only (get-dispute-appeal (dispute-id uint) (appeal-number uint))
+    (map-get? DisputeAppeals {dispute-id: dispute-id, appeal-number: appeal-number})
+)
+
+(define-read-only (get-seller-dispute-stats (seller principal))
+    (map-get? SellerDisputeStats {seller: seller})
+)
+
+(define-read-only (get-next-dispute-id)
+    (var-get next-dispute-id)
+)
